@@ -1,11 +1,12 @@
 use actix_web::{App, HttpServer, web};
-use context_service::{AppState, CompressResponse, RateLimiter, app_config};
+use context_service::{AppState, CompressResponse, DocumentStore, RateLimiter, app_config};
 
 #[tokio::test]
 async fn compress_endpoint_returns_budgeted_context() {
     let app_state = web::Data::new(AppState {
         secret: String::new(),
         rate_limiter: RateLimiter::new(0),
+        documents: DocumentStore::new(),
     });
 
     let listener = std::net::TcpListener::bind("127.0.0.1:0").expect("bind random port");

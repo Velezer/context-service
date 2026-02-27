@@ -1,11 +1,12 @@
 use actix_web::{App, HttpServer, web};
-use context_service::{AppState, RateLimiter, app_config};
+use context_service::{AppState, DocumentStore, RateLimiter, app_config};
 
 #[tokio::test]
 async fn context_endpoint_rejects_invalid_hmac() {
     let app_state = web::Data::new(AppState {
         secret: "integration-secret".to_string(),
         rate_limiter: RateLimiter::new(0),
+        documents: DocumentStore::new(),
     });
 
     let listener = std::net::TcpListener::bind("127.0.0.1:0").expect("bind random port");

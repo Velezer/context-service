@@ -1,73 +1,48 @@
 # context-service
 
-A small HTTP service for exposing runtime context and compressing repository context into a token-budgeted summary for LLM workflows.
+HTTP + CLI context service with:
 
-## What it does
+- Secure runtime context endpoint (`GET /context`)
+- Context compression for token budgets (`POST /context/compress`)
+- CRUD document management (`POST/GET/PUT/DELETE /documents/{id}`)
+- Lightweight RAG retrieval endpoint (`POST /rag/query`)
+- `context_cli` binary for GitHub Actions integration
 
-- `GET /context`: Returns environment variables prefixed with `CTX_` as JSON.
-- `POST /context/compress`: Accepts raw context and file contents, then returns a structured compressed context constrained by a token budget.
+## Run service
 
-## Best-practice setup
+```bash
+cargo run
+```
 
-### 1) Prerequisites
+Service binds to `0.0.0.0:8080`.
 
-- Rust toolchain (matching `rust-toolchain.toml`)
-- `cargo`
-- Optional: `curl` for manual endpoint checks
-
-### 2) Configure environment
-
-Create a `.env` file in the project root:
+## Environment
 
 ```env
 API_SECRET=your_shared_secret
 RATE_LIMIT_SECS=1
 CTX_APP_NAME=context-service
 CTX_ENV=local
-CTX_OWNER=platform-team
 ```
-
-Notes:
 
 - `API_SECRET` enables HMAC auth on `GET /context`.
-- `RATE_LIMIT_SECS` sets per-IP minimum interval between requests.
-- Any variable beginning with `CTX_` is exposed by `GET /context`.
+- `RATE_LIMIT_SECS` applies per-IP cooldown.
+- `CTX_*` values are returned by `/context`.
 
-### 3) Run the service
+## API usage
 
-```bash
-cargo run
-```
-
-Server binds to `0.0.0.0:8080`.
-
-## Using `GET /context`
-
-When `API_SECRET` is configured, requests must include:
-
-- `X-Timestamp`: current unix timestamp in seconds
-- `Authorization`: HMAC-SHA256 hex digest of `timestamp=<X-Timestamp>` using `API_SECRET`
-
-### Generate auth headers (bash + openssl)
+### `GET /context`
 
 ```bash
 TS=$(date +%s)
 SIG=$(printf "timestamp=%s" "$TS" | openssl dgst -sha256 -hmac "$API_SECRET" -binary | xxd -p -c 256)
-```
 
-### Call endpoint
-
-```bash
 curl -sS http://127.0.0.1:8080/context \
   -H "X-Timestamp: $TS" \
   -H "Authorization: $SIG" | jq
 ```
 
-If `API_SECRET` is empty, signature checks are bypassed.
-
-## Using `POST /context/compress`
-
-### Request example
+### `POST /context/compress`
 
 ```bash
 curl -sS http://127.0.0.1:8080/context/compress \
@@ -82,58 +57,59 @@ curl -sS http://127.0.0.1:8080/context/compress \
   }' | jq
 ```
 
-### Response fields
-
-- `summary`: High-level description of included material.
-- `compressed_context`: Generated markdown summary/snippets.
-- `estimated_tokens`: Approximate token count (`chars / 4`, rounded up).
-- `truncated`: `true` if output was cut to fit token budget.
-
-
-## Why you currently cannot open a pull request
-
-If `git remote -v` prints nothing, this repository has no remote configured, so there is nowhere to push your branch and no platform (GitHub/GitLab) to open a PR against.
-
-### Best-practice PR setup
-
-1. Add your remote origin:
+### CRUD documents
 
 ```bash
-git remote add origin <your-repository-url>
+curl -sS http://127.0.0.1:8080/documents -H 'Content-Type: application/json' -d '{
+  "id":"doc-1",
+  "title":"Action workflow",
+  "content":"GitHub action uploads repo context and queries RAG"
+}' | jq
+
+curl -sS http://127.0.0.1:8080/documents/doc-1 | jq
+
+curl -sS -X PUT http://127.0.0.1:8080/documents/doc-1 -H 'Content-Type: application/json' -d '{
+  "title":"Action workflow v2",
+  "content":"Updated workflow with tests and retrieval"
+}' | jq
+
+curl -sS -X DELETE http://127.0.0.1:8080/documents/doc-1 | jq
 ```
 
-2. Verify remotes:
+### RAG query
 
 ```bash
-git remote -v
+curl -sS http://127.0.0.1:8080/rag/query -H 'Content-Type: application/json' -d '{
+  "query": "workflow retrieval tests",
+  "top_k": 3
+}' | jq
 ```
 
-3. Push your branch and set upstream:
+## CLI mode (`context_cli`)
+
+Use the CLI to integrate in CI/CD and GitHub Actions.
 
 ```bash
-git push -u origin $(git branch --show-current)
+cargo run --bin context_cli -- --server-url http://127.0.0.1:8080 compress \
+  --context "Repo context" \
+  --include README.md \
+  --include src/main.rs \
+  --max-tokens 180
 ```
 
-4. Open a pull request from your pushed branch (via your Git provider UI or CLI).
+CRUD + RAG from CLI:
 
-If your organization requires a fork model, add both `origin` (your fork) and `upstream` (main repo), then push to `origin` and open PR to `upstream`.
+```bash
+cargo run --bin context_cli -- --server-url http://127.0.0.1:8080 create --id doc-1 --content "rust github action retrieval"
+cargo run --bin context_cli -- --server-url http://127.0.0.1:8080 rag-query --query "github retrieval" --top-k 1
+```
 
-## Development workflow
+## GitHub Actions workflow
 
-### Run tests (includes e2e)
+CI workflow runs formatting, clippy, and all tests (including e2e) on each push/PR.
+
+## Test locally
 
 ```bash
 cargo test
 ```
-
-### Run only end-to-end tests
-
-```bash
-cargo test --test e2e_compress --test e2e_usage --test e2e_auth_rejection
-```
-
-## Operational guidance
-
-- Keep `API_SECRET` set in non-local environments.
-- Use short `RATE_LIMIT_SECS` for interactive usage, higher for abuse-prone deployments.
-- Avoid injecting sensitive values into `CTX_` variables unless clients are authorized to read them.

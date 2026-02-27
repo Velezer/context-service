@@ -1,5 +1,5 @@
 use actix_web::web;
-use context_service::{AppState, RateLimiter, run_server};
+use context_service::{AppState, DocumentStore, RateLimiter, run_server};
 use dotenv::dotenv;
 
 #[actix_web::main]
@@ -14,6 +14,7 @@ async fn main() -> std::io::Result<()> {
     let app_state = web::Data::new(AppState {
         secret,
         rate_limiter: RateLimiter::new(rate_limit_seconds),
+        documents: DocumentStore::new(),
     });
 
     run_server(("0.0.0.0", 8080), app_state).await

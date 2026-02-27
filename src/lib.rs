@@ -2,7 +2,7 @@ use actix_web::{App, HttpRequest, HttpResponse, HttpServer, Responder, web};
 use hmac::{Hmac, Mac};
 use serde::{Deserialize, Serialize};
 use sha2::Sha256;
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::sync::Mutex;
 use std::time::{SystemTime, UNIX_EPOCH};
 
@@ -28,7 +28,7 @@ impl RateLimiter {
         }
 
         let now = current_unix_seconds();
-        let mut limits = self.limits.lock().unwrap();
+        let mut limits = self.limits.lock().expect("rate limiter lock poisoned");
         match limits.get(ip) {
             Some(&last) if now.saturating_sub(last) < self.window_seconds => false,
             _ => {
@@ -39,16 +39,71 @@ impl RateLimiter {
     }
 }
 
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct Document {
+    pub id: String,
+    pub title: Option<String>,
+    pub content: String,
+}
+
+#[derive(Debug, Default)]
+pub struct DocumentStore {
+    documents: Mutex<HashMap<String, Document>>,
+}
+
+impl DocumentStore {
+    pub fn new() -> Self {
+        Self {
+            documents: Mutex::new(HashMap::new()),
+        }
+    }
+
+    pub fn create(&self, document: Document) -> Result<(), &'static str> {
+        let mut docs = self.documents.lock().expect("document store lock poisoned");
+        if docs.contains_key(&document.id) {
+            return Err("Document already exists");
+        }
+        docs.insert(document.id.clone(), document);
+        Ok(())
+    }
+
+    pub fn read(&self, id: &str) -> Option<Document> {
+        let docs = self.documents.lock().expect("document store lock poisoned");
+        docs.get(id).cloned()
+    }
+
+    pub fn update(&self, id: &str, payload: UpsertDocumentRequest) -> Option<Document> {
+        let mut docs = self.documents.lock().expect("document store lock poisoned");
+        if let Some(existing) = docs.get_mut(id) {
+            existing.title = payload.title;
+            existing.content = payload.content;
+            return Some(existing.clone());
+        }
+        None
+    }
+
+    pub fn delete(&self, id: &str) -> Option<Document> {
+        let mut docs = self.documents.lock().expect("document store lock poisoned");
+        docs.remove(id)
+    }
+
+    pub fn all(&self) -> Vec<Document> {
+        let docs = self.documents.lock().expect("document store lock poisoned");
+        docs.values().cloned().collect()
+    }
+}
+
 #[derive(Debug)]
 pub struct AppState {
     pub secret: String,
     pub rate_limiter: RateLimiter,
+    pub documents: DocumentStore,
 }
 
 fn current_unix_seconds() -> u64 {
     SystemTime::now()
         .duration_since(UNIX_EPOCH)
-        .unwrap()
+        .expect("clock drift before UNIX_EPOCH")
         .as_secs()
 }
 
@@ -62,7 +117,7 @@ fn verify_hmac(secret: &str, timestamp: u64, signature: &str) -> bool {
         return false;
     }
 
-    let mut mac = HmacSha256::new_from_slice(secret.as_bytes()).unwrap();
+    let mut mac = HmacSha256::new_from_slice(secret.as_bytes()).expect("invalid hmac key");
     mac.update(format!("timestamp={}", timestamp).as_bytes());
     let expected = mac
         .finalize()
@@ -110,19 +165,19 @@ pub async fn get_context(req: HttpRequest, data: web::Data<AppState>) -> impl Re
     HttpResponse::Ok().json(context)
 }
 
-#[derive(Debug, Deserialize)]
+#[derive(Debug, Deserialize, Serialize)]
 pub struct ContextFile {
-    path: String,
-    content: String,
+    pub path: String,
+    pub content: String,
 }
 
-#[derive(Debug, Deserialize)]
+#[derive(Debug, Deserialize, Serialize)]
 pub struct CompressRequest {
     #[serde(default)]
-    context: String,
+    pub context: String,
     #[serde(default)]
-    files: Vec<ContextFile>,
-    max_tokens: Option<usize>,
+    pub files: Vec<ContextFile>,
+    pub max_tokens: Option<usize>,
 }
 
 #[derive(Debug, Serialize, Deserialize)]
@@ -170,7 +225,7 @@ fn summarize_file(file: &ContextFile) -> String {
             || trimmed.starts_with("impl ")
             || trimmed.starts_with("class ")
             || trimmed.starts_with("interface ")
-            || trimmed.starts_with("#")
+            || trimmed.starts_with('#')
         {
             bullets.push(format!(
                 "- {}",
@@ -199,7 +254,7 @@ fn summarize_file(file: &ContextFile) -> String {
     format!("### {}\n{}", file.path, bullets.join("\n"))
 }
 
-fn compress_context(payload: &CompressRequest) -> CompressResponse {
+pub fn compress_context(payload: &CompressRequest) -> CompressResponse {
     let max_tokens = payload.max_tokens.unwrap_or(2000).max(64);
 
     let mut files = payload.files.iter().collect::<Vec<_>>();
@@ -270,13 +325,141 @@ fn compress_context(payload: &CompressRequest) -> CompressResponse {
     }
 }
 
+#[derive(Debug, Deserialize, Serialize)]
+pub struct CreateDocumentRequest {
+    pub id: String,
+    pub title: Option<String>,
+    pub content: String,
+}
+
+#[derive(Debug, Deserialize, Serialize)]
+pub struct UpsertDocumentRequest {
+    pub title: Option<String>,
+    pub content: String,
+}
+
+#[derive(Debug, Serialize, Deserialize)]
+pub struct RagQueryRequest {
+    pub query: String,
+    pub top_k: Option<usize>,
+}
+
+#[derive(Debug, Serialize, Deserialize)]
+pub struct RagMatch {
+    pub id: String,
+    pub title: Option<String>,
+    pub score: usize,
+    pub excerpt: String,
+}
+
+#[derive(Debug, Serialize, Deserialize)]
+pub struct RagQueryResponse {
+    pub query: String,
+    pub matches: Vec<RagMatch>,
+}
+
+fn tokenize(input: &str) -> HashSet<String> {
+    input
+        .split(|c: char| !c.is_alphanumeric())
+        .filter(|token| !token.is_empty())
+        .map(|token| token.to_lowercase())
+        .collect()
+}
+
+fn rag_search(documents: &[Document], query: &str, top_k: usize) -> Vec<RagMatch> {
+    let query_terms = tokenize(query);
+
+    let mut matches = documents
+        .iter()
+        .map(|doc| {
+            let doc_terms = tokenize(&doc.content);
+            let score = query_terms.intersection(&doc_terms).count();
+            let excerpt = doc.content.chars().take(220).collect::<String>();
+            RagMatch {
+                id: doc.id.clone(),
+                title: doc.title.clone(),
+                score,
+                excerpt,
+            }
+        })
+        .filter(|m| m.score > 0)
+        .collect::<Vec<_>>();
+
+    matches.sort_by(|a, b| b.score.cmp(&a.score).then_with(|| a.id.cmp(&b.id)));
+    matches.truncate(top_k);
+    matches
+}
+
 pub async fn post_context_compress(payload: web::Json<CompressRequest>) -> impl Responder {
     HttpResponse::Ok().json(compress_context(&payload.into_inner()))
 }
 
+pub async fn create_document(
+    data: web::Data<AppState>,
+    payload: web::Json<CreateDocumentRequest>,
+) -> impl Responder {
+    let document = Document {
+        id: payload.id.clone(),
+        title: payload.title.clone(),
+        content: payload.content.clone(),
+    };
+
+    match data.documents.create(document.clone()) {
+        Ok(()) => HttpResponse::Created().json(document),
+        Err(msg) => HttpResponse::Conflict().body(msg),
+    }
+}
+
+pub async fn get_document(path: web::Path<String>, data: web::Data<AppState>) -> impl Responder {
+    match data.documents.read(&path.into_inner()) {
+        Some(document) => HttpResponse::Ok().json(document),
+        None => HttpResponse::NotFound().body("Document not found"),
+    }
+}
+
+pub async fn update_document(
+    path: web::Path<String>,
+    data: web::Data<AppState>,
+    payload: web::Json<UpsertDocumentRequest>,
+) -> impl Responder {
+    match data
+        .documents
+        .update(&path.into_inner(), payload.into_inner())
+    {
+        Some(document) => HttpResponse::Ok().json(document),
+        None => HttpResponse::NotFound().body("Document not found"),
+    }
+}
+
+pub async fn delete_document(path: web::Path<String>, data: web::Data<AppState>) -> impl Responder {
+    match data.documents.delete(&path.into_inner()) {
+        Some(document) => HttpResponse::Ok().json(document),
+        None => HttpResponse::NotFound().body("Document not found"),
+    }
+}
+
+pub async fn rag_query(
+    data: web::Data<AppState>,
+    payload: web::Json<RagQueryRequest>,
+) -> impl Responder {
+    let top_k = payload.top_k.unwrap_or(3).max(1);
+    let all_documents = data.documents.all();
+    let matches = rag_search(&all_documents, &payload.query, top_k);
+
+    HttpResponse::Ok().json(RagQueryResponse {
+        query: payload.query.clone(),
+        matches,
+    })
+}
+
 pub fn app_config(cfg: &mut web::ServiceConfig) {
     cfg.route("/context", web::get().to(get_context))
-        .route("/context/compress", web::post().to(post_context_compress));
+        .route("/context/compress", web::post().to(post_context_compress))
+        .route("/documents", web::post().to(create_document))
+        .route("/documents/{id}", web::get().to(get_document))
+        .route("/documents/{id}", web::put().to(update_document))
+        .route("/documents/{id}", web::delete().to(delete_document))
+        .route("/rag/query", web::post().to(rag_query));
 }
 
 pub async fn run_server(
@@ -304,5 +487,25 @@ mod tests {
         let result = compress_context(&req);
         assert!(result.estimated_tokens <= 200);
         assert!(result.truncated);
+    }
+
+    #[test]
+    fn rag_returns_highest_overlap_first() {
+        let documents = vec![
+            Document {
+                id: "a".to_string(),
+                title: Some("alpha".to_string()),
+                content: "rust cli github action integration".to_string(),
+            },
+            Document {
+                id: "b".to_string(),
+                title: Some("beta".to_string()),
+                content: "python flask context service".to_string(),
+            },
+        ];
+
+        let matches = rag_search(&documents, "rust github integration", 2);
+        assert_eq!(matches[0].id, "a");
+        assert!(matches[0].score >= 2);
     }
 }
